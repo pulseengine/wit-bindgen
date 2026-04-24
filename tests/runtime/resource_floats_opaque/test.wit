@@ -21,22 +21,15 @@ world leaf {
 // under test is *constructor forwarding* — a 3-component chain where
 // intermediate's constructor builds an inner resource and returns the
 // inner handle as the exported rep verbatim.
-//   1. runner constructs a chain.float (calls into intermediate)
-//   2. intermediate constructs a chain.float in leaf, returns its handle
-//      verbatim as the rep (no Box, no deref)
-//   3. runner drops the chain.float (calls intermediate's drop)
 //
-// Method forwarding (e.g. `get`) for opaque-rep resources requires
-// deeper generator changes; this fixture exercises only the
-// load-bearing constructor + drop path.
+// Both `import chain` and `export chain` reference the same named
+// interface `test:resource-floats-opaque/chain`. The Component Model
+// gives them distinct resource type identities (different ownership),
+// but the names match directly during WAC composition — no aliasing
+// layer needed.
 world intermediate {
+  import chain;
   export chain;
-
-  import imports-chain: interface {
-    resource float {
-      constructor(v: f64);
-    }
-  }
 }
 
 world runner {

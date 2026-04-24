@@ -3,7 +3,7 @@
 include!(env!("BINDINGS"));
 
 use exports::test::resource_floats_opaque::chain::{Guest, GuestFloat};
-use imports_chain::Float as ImportFloat;
+use test::resource_floats_opaque::chain::Float as ImportFloat;
 
 struct Component;
 

@@ -2,7 +2,7 @@ package example:composition;
 
 let leaf = new test:leaf { ... };
 let intermediate = new test:intermediate {
-  imports-chain: leaf.chain,
+  chain: leaf.chain,
   ...
 };
 let runner = new test:runner {
