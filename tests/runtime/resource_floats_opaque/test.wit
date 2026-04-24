@@ -1,0 +1,63 @@
+//@ dependencies = ['intermediate', 'leaf']
+//@ wac = 'compose.wac'
+
+package test:resource-floats-opaque;
+
+interface test {
+  resource float {
+    constructor(v: f64);
+    get: func() -> f64;
+  }
+}
+
+// Re-exporter interface: constructor-only float. Both intermediate
+// (export) and runner (import) reference this shared interface so the
+// resource types match by reference during WAC composition.
+interface chain {
+  resource float {
+    constructor(v: f64);
+  }
+}
+
+world leaf {
+  export test;
+
+  // Leaf also exports the chain interface so the intermediate's
+  // `import chain` can be wired to it via WAC. (The intermediate's
+  // constructor will forward inner handles from leaf in the actual
+  // runtime path.)
+  export chain;
+}
+
+// Opaque-rep stress fixture: deliberately omit methods on the chain
+// interface. The pattern under test is *constructor forwarding* — a
+// 3-component chain where intermediate's constructor builds an inner
+// resource and returns the inner handle as the exported rep verbatim.
+//   1. runner constructs a chain.float (calls into intermediate)
+//   2. intermediate constructs a chain.float in leaf, returns its handle
+//      verbatim as the rep (no Box, no deref)
+//   3. runner drops the chain.float (calls intermediate's drop)
+//
+// Method forwarding (e.g. `get`) for opaque-rep resources requires deeper
+// generator changes (see prototype notes). Constructor forwarding alone
+// is the load-bearing case for proving meld can fuse the chain without
+// trapping.
+world intermediate {
+  use test.{float};
+
+  export chain;
+
+  import imports-chain: interface {
+    resource float {
+      constructor(v: f64);
+    }
+  }
+}
+
+world runner {
+  use test.{float};
+
+  import chain;
+
+  export run: func();
+}

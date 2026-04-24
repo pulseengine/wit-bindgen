@@ -985,15 +985,30 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                     FunctionKind::Constructor(ty) => {
                         let return_type =
                             classify_constructor_return_type(resolve, *ty, &func.result);
-                        let ty = resolve.types[*ty]
+                        let resource_name = resolve.types[*ty]
                             .name
                             .as_deref()
-                            .unwrap()
-                            .to_upper_camel_case();
+                            .unwrap();
+                        let opaque = self
+                            .r#gen
+                            .r#gen
+                            .opts
+                            .opaque_export_resources
+                            .iter()
+                            .any(|n| n == resource_name);
+                        let ty = resource_name.to_upper_camel_case();
 
                         match return_type {
                             ConstructorReturnType::Self_ => {
-                                self.push_str(&format!("{ty}::new(T_::new"));
+                                if opaque {
+                                    // Opaque-rep wrappers' `new` is generic
+                                    // over `T: GuestResource` with no
+                                    // parameter to infer from. Emit the
+                                    // turbofish so the shim picks `T_`.
+                                    self.push_str(&format!("{ty}::new::<T_>(T_::new"));
+                                } else {
+                                    self.push_str(&format!("{ty}::new(T_::new"));
+                                }
                             }
                             ConstructorReturnType::Result { .. } => {
                                 self.push_str(&format!("T_::new"));

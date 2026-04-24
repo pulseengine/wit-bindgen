@@ -1451,14 +1451,38 @@ unsafe fn call_import(&mut self, _params: Self::ParamsLower, _results: *mut u8) 
         let params = self.print_docs_and_params(func, params_owned, sig);
         self.push_str(" -> ");
         if let FunctionKind::Constructor(resource_id) = &func.kind {
-            match classify_constructor_return_type(&self.resolve, *resource_id, &func.result) {
-                ConstructorReturnType::Self_ => {
-                    self.push_str("Self");
-                }
-                ConstructorReturnType::Result { err } => {
-                    self.push_str("Result<Self, ");
-                    self.print_result_type(&err);
-                    self.push_str("> where Self: Sized");
+            // Opt-in opaque-rep constructors return `u32` instead of `Self`.
+            // The rep is forwarded as-is to the wrapper's `new(rep: u32)`
+            // by the canonical-ABI export shim. This keeps the shim emit
+            // path unchanged while letting user code construct the resource
+            // without ever owning a `T` to box.
+            //
+            // Only applies to EXPORTED resources. Imported resources keep
+            // the standard `Self`-returning `new` wrapper because their
+            // rep is constructed by an out-of-process component.
+            let opaque = !self.in_import && {
+                let name = self.resolve.types[*resource_id]
+                    .name
+                    .as_deref()
+                    .unwrap_or("");
+                self.r#gen
+                    .opts
+                    .opaque_export_resources
+                    .iter()
+                    .any(|n| n == name)
+            };
+            if opaque {
+                self.push_str("u32");
+            } else {
+                match classify_constructor_return_type(&self.resolve, *resource_id, &func.result) {
+                    ConstructorReturnType::Self_ => {
+                        self.push_str("Self");
+                    }
+                    ConstructorReturnType::Result { err } => {
+                        self.push_str("Result<Self, ");
+                        self.print_result_type(&err);
+                        self.push_str("> where Self: Sized");
+                    }
                 }
             }
         } else {
@@ -2717,6 +2741,86 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
                 Identifier::StreamOrFuturePayload => unreachable!(),
             };
             let box_path = self.path_to_box();
+            // Opt-in: when the resource name appears in
+            // `Opts.opaque_export_resources`, emit a stripped-down wrapper
+            // that never dereferences the rep pointer. The user code is
+            // responsible for treating the rep as an opaque `u32` (typically
+            // forwarding it to another component as a re-exporter).
+            let opaque_rep = self
+                .r#gen
+                .opts
+                .opaque_export_resources
+                .iter()
+                .any(|n| n == name);
+            if opaque_rep {
+                uwriteln!(
+                    self.src,
+                    r#"
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct {camel} {{
+    handle: {resource}<{camel}>,
+}}
+
+impl {camel} {{
+    /// Creates a new resource handle from an opaque `u32` representation.
+    ///
+    /// The supplied `rep` is passed verbatim to the component model
+    /// `[resource-new]` intrinsic. No `Box`-allocation, no type-erasure,
+    /// no dereference. The component runtime stores this `rep` against
+    /// the returned handle.
+    ///
+    /// Named `new` (rather than `from_rep`) so the canonical-ABI export
+    /// shim, which emits `{camel}::new(T_::new(...))`, continues to type-
+    /// check unchanged: the user's `T_::new` simply returns a `u32`.
+    ///
+    /// This is the entry-point for the `opaque_export_resources` opt-in:
+    /// callers (typically wit-bindgen-generated re-exporter constructors)
+    /// pass the inner-component handle as the rep, and the resource is
+    /// statically fusable because no dereference of `rep` ever happens
+    /// in user code.
+    pub fn new<T: Guest{camel}>(rep: u32) -> Self {{
+        unsafe {{
+            Self::from_handle(T::_resource_new(rep as *mut u8))
+        }}
+    }}
+
+    /// Returns the opaque `u32` representation associated with this handle.
+    ///
+    /// Reads the rep via `[resource-rep]` and casts it to `u32` without
+    /// dereferencing. Pair with `new` to round-trip through the component
+    /// model.
+    pub fn rep<T: Guest{camel}>(&self) -> u32 {{
+        T::_resource_rep(self.handle()) as u32
+    }}
+
+    #[doc(hidden)]
+    pub unsafe fn from_handle(handle: u32) -> Self {{
+        Self {{
+            handle: unsafe {{ {resource}::from_handle(handle) }},
+        }}
+    }}
+
+    #[doc(hidden)]
+    pub fn take_handle(&self) -> u32 {{
+        {resource}::take_handle(&self.handle)
+    }}
+
+    #[doc(hidden)]
+    pub fn handle(&self) -> u32 {{
+        {resource}::handle(&self.handle)
+    }}
+
+    /// No-op destructor. Opaque-rep resources do not own boxed memory in
+    /// the component that re-exports them — the rep is just a `u32` that
+    /// references something owned by another component. The drop intrinsic
+    /// is wired below so the runtime still gets called, but there is
+    /// nothing to free here.
+    #[doc(hidden)]
+    pub unsafe fn dtor<T: 'static>(_rep: *mut u8) {{}}
+}}"#
+                );
+            } else {
             uwriteln!(
                 self.src,
                 r#"
@@ -2842,6 +2946,39 @@ impl<'a> {camel}Borrow<'a>{{
 }}
                 "#
             );
+            }
+            // The opaque-rep variant emits a borrowed view that exposes only
+            // the `u32` rep. No deref, no `_FooRep<T>` cast.
+            if opaque_rep {
+                uwriteln!(
+                    self.src,
+                    r#"
+/// A borrowed version of [`{camel}`] for opaque-rep resources. Exposes the
+/// underlying `u32` rep directly without dereferencing.
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct {camel}Borrow<'a> {{
+    rep: u32,
+    _marker: core::marker::PhantomData<&'a {camel}>,
+}}
+
+impl<'a> {camel}Borrow<'a> {{
+    #[doc(hidden)]
+    pub unsafe fn lift(rep: usize) -> Self {{
+        Self {{
+            rep: rep as u32,
+            _marker: core::marker::PhantomData,
+        }}
+    }}
+
+    /// Returns the opaque `u32` rep underlying this borrow.
+    pub fn rep(&self) -> u32 {{
+        self.rep
+    }}
+}}
+                "#
+                );
+            }
             format!("[export]{module}")
         };
 

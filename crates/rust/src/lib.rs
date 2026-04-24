@@ -304,6 +304,24 @@ pub struct Opts {
     /// If true, methods normally returning `()` instead return `&Self`. This applies to both imported and exported methods.
     #[cfg_attr(feature = "clap", arg(long))]
     pub enable_method_chaining: bool,
+
+    /// Names of exported resources whose representation should be treated as
+    /// opaque. When a resource is listed here, the rust generator skips
+    /// emitting the unsafe `as_ptr` / `get` / `get_mut` / `into_inner` /
+    /// `dtor` helpers and the `_FooRep<T>` type alias for that resource.
+    ///
+    /// This is intended for re-exporter / pass-through patterns where the
+    /// user code never dereferences the rep pointer it would otherwise
+    /// receive from `_resource_rep` — it just round-trips the rep through
+    /// to another component. Such components are statically fusable by
+    /// tools like `meld` because no rep dereference happens in user code,
+    /// avoiding `assume(ptr.is_aligned())` traps when the rep originates
+    /// from a different component's memory.
+    ///
+    /// Each entry is the bare resource name (e.g., `"float"`), matching the
+    /// resource name as it appears in WIT.
+    #[cfg_attr(feature = "clap", arg(long, value_name = "NAME"))]
+    pub opaque_export_resources: Vec<String>,
 }
 
 impl Opts {
