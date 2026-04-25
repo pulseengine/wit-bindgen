@@ -3,13 +3,18 @@
 
 package test:resource-floats-opaque;
 
-// Re-exporter interface: constructor-only float. The runner imports it,
-// the intermediate exports it, and the leaf provides the underlying
-// implementation. The intermediate's constructor forwards an inner
-// handle from the leaf as the exported rep verbatim — no Box, no deref.
+// Re-exporter interface with both constructor and method. The runner
+// imports it, the intermediate exports it, and the leaf provides the
+// underlying implementation. The intermediate's constructor forwards
+// an inner handle from the leaf as the exported rep verbatim — no
+// Box, no deref. The `get` method exercises the borrow path: with
+// opaque-rep enabled, the trait method takes a raw `u32` handle
+// instead of `&self` and the user code forwards it to the inner
+// component.
 interface chain {
   resource float {
     constructor(v: f64);
+    get: func() -> f64;
   }
 }
 
@@ -17,10 +22,14 @@ world leaf {
   export chain;
 }
 
-// Opaque-rep stress fixture: deliberately omit methods. The pattern
-// under test is *constructor forwarding* — a 3-component chain where
-// intermediate's constructor builds an inner resource and returns the
-// inner handle as the exported rep verbatim.
+// Opaque-rep stress fixture exercising both constructor forwarding and
+// method (borrow) forwarding through a 3-component chain:
+//   1. runner constructs a chain.float (calls into intermediate)
+//   2. intermediate constructs a chain.float in leaf, returns its handle
+//      verbatim as the rep (no Box, no deref)
+//   3. runner calls f.get() — meld's per-resource handle table routes
+//      the borrow as a raw u32; user code forwards it to leaf
+//   4. runner drops the float
 //
 // Both `import chain` and `export chain` reference the same named
 // interface `test:resource-floats-opaque/chain`. The Component Model

@@ -403,8 +403,18 @@ impl Bindgen for FunctionBindgen<'_, '_> {
                 let dealiased_resource = dealias(resolve, *resource);
 
                 let name = self.r#gen.type_path(dealiased_resource, true);
+                let opaque_rep_export = !is_own
+                    && self.r#gen.is_exported_resource(*resource)
+                    && self.r#gen.is_opaque_export_resource(dealiased_resource);
                 let result = if is_own {
                     format!("{name}::from_handle({op} as u32)")
+                } else if opaque_rep_export {
+                    // Opaque-rep export: skip `XBorrow::lift` (which would
+                    // wrap the handle in a typed Borrow whose `.get::<T>()`
+                    // dereferences the rep as `&T`). The trait method
+                    // accepts a raw `u32` handle, so pass the canonical
+                    // handle through unchanged.
+                    format!("{op} as u32")
                 } else if self.r#gen.is_exported_resource(*resource) {
                     format!("{name}Borrow::lift({op} as u32 as usize)")
                 } else {
@@ -1028,12 +1038,21 @@ impl Bindgen for FunctionBindgen<'_, '_> {
 
                     // Automatically convert `Borrow<'_, AResource>` to
                     // `&Self` since traits have `&self` as their
-                    // first arguments.
+                    // first arguments. For opaque-rep resources the trait
+                    // takes a raw `u32` handle instead of `&self`, and
+                    // HandleLift already passed the raw handle through —
+                    // skip the `.get()` so the operand is used as-is.
                     if i == 0
                         && (matches!(func.kind, FunctionKind::Method(_))
                             || matches!(func.kind, FunctionKind::AsyncMethod(_)))
                     {
-                        self.push_str(".get()")
+                        let opaque_rep_method = match func.kind.resource() {
+                            Some(rid) => self.r#gen.is_opaque_export_resource(rid),
+                            None => false,
+                        };
+                        if !opaque_rep_method {
+                            self.push_str(".get()");
+                        }
                     }
                 }
                 self.push_str(")");

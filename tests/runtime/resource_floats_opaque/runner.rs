@@ -8,20 +8,23 @@ export!(Component);
 
 impl Guest for Component {
     fn run() {
-        // Construct two opaque-rep re-exported Floats and drop them.
-        // This exercises:
-        //   1. runner -> intermediate.exports.float-constructor
-        //   2. intermediate -> imports.float-constructor (= leaf)
-        //   3. leaf returns inner handle, intermediate returns it as rep
-        //   4. runner drops the float
-        //   5. intermediate's drop fires (no-op `dtor` for opaque-rep)
-        //   6. leaf's drop fires for the inner float (via runtime teardown)
+        // Exercise opaque-rep through a 3-component chain:
+        //   1. runner -> intermediate.chain.float-constructor
+        //   2. intermediate -> leaf chain.float-constructor (forwards handle)
+        //   3. runner -> intermediate.chain.float.get (borrow forwarding)
+        //   4. intermediate -> leaf chain.float.get
+        //   5. drop fires (no-op opaque dtor; leaf cleans up at teardown)
         //
-        // No method calls — methods on opaque-rep resources need further
-        // generator work (see intermediate.rs comments). Constructor +
-        // drop is the load-bearing case.
+        // Each constructor adds 1.0 (intermediate) + 2.0 (leaf) = +3.0 to v.
+        // Each get() adds 3.0 in leaf. So input 42.0 -> get -> 48.0.
         let f1 = ReExportedFloat::new(42.0);
+        let v1 = f1.get();
+        assert_eq!(v1, 48.0);
+
         let f2 = ReExportedFloat::new(7.0);
+        let v2 = f2.get();
+        assert_eq!(v2, 13.0);
+
         drop(f1);
         drop(f2);
     }

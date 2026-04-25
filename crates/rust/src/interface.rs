@@ -135,6 +135,25 @@ enum PayloadFor {
 }
 
 impl<'i> InterfaceGenerator<'i> {
+    /// Returns true when the given resource is opted into the
+    /// `--opaque-export-resources` mode AND is being emitted as an export
+    /// (not an import). Imports are unaffected because their rep is
+    /// constructed elsewhere.
+    pub(super) fn is_opaque_export_resource(&self, resource_id: TypeId) -> bool {
+        if self.in_import {
+            return false;
+        }
+        let name = match self.resolve.types[resource_id].name.as_deref() {
+            Some(n) => n,
+            None => return false,
+        };
+        self.r#gen
+            .opts
+            .opaque_export_resources
+            .iter()
+            .any(|n| n == name)
+    }
+
     pub(super) fn generate_exports<'a>(
         &mut self,
         interface: Option<(InterfaceId, &WorldKey)>,
@@ -180,6 +199,21 @@ impl<'i> InterfaceGenerator<'i> {
                 ..Default::default()
             };
             sig.update_for_func(&func);
+            // Opaque-rep methods: replace the synthetic `&self` arg with a
+            // raw `handle: u32`. Self is the unit type so `&self` carries no
+            // runtime info; user code receives the canonical handle directly
+            // and is responsible for forwarding to the inner component.
+            if let Some(rid) = resource
+                && self.is_opaque_export_resource(rid)
+                && matches!(
+                    func.kind,
+                    FunctionKind::Method(_) | FunctionKind::AsyncMethod(_)
+                )
+            {
+                sig.self_arg = Some("handle: u32".into());
+                // self_is_first_param remains true so the borrow param at
+                // index 0 of func.params is suppressed (replaced by `handle`).
+            }
             self.print_signature(func, true, &sig);
             self.src.push_str(";\n");
             let trait_method = mem::replace(&mut self.src, prev);
