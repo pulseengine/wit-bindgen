@@ -13,7 +13,11 @@ impl Guest for Component {
         //   2. intermediate -> leaf chain.float-constructor (forwards handle)
         //   3. runner -> intermediate.chain.float.get (borrow forwarding)
         //   4. intermediate -> leaf chain.float.get
-        //   5. drop fires (no-op opaque dtor; leaf cleans up at teardown)
+        //   5. drop fires: opaque-rep dtor reconstructs the inner handle
+        //      via `from_handle` and drops it, triggering the leaf's
+        //      `[resource-drop]float` intrinsic so the leaf actually frees
+        //      its boxed `MyFloat`. If the dtor mis-fires (double-free,
+        //      mishandled rep, etc.), wasmtime will trap.
         //
         // Each constructor adds 1.0 (intermediate) + 2.0 (leaf) = +3.0 to v.
         // Each get() adds 3.0 in leaf. So input 42.0 -> get -> 48.0.

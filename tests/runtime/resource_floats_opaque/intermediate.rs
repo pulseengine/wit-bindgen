@@ -49,4 +49,16 @@ impl GuestFloat for () {
         let _ = inner.take_handle();
         result
     }
+
+    /// Re-exporter destructor in the opaque-rep style.
+    ///
+    /// The rep stored against the exported handle is the inner-component
+    /// handle (from `new`). To release it, reconstruct the inner wrapper
+    /// via `from_handle` and let it drop — that fires the leaf's
+    /// `[resource-drop]float` intrinsic so the leaf can free its boxed
+    /// `MyFloat`. Without this the inner handle would leak.
+    fn dtor(handle: u32) {
+        let inner = unsafe { ImportFloat::from_handle(handle) };
+        drop(inner);
+    }
 }

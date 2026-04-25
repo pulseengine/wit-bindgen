@@ -273,6 +273,31 @@ fn _resource_rep(handle: u32) -> *mut u8
 
                     "#
             );
+            // For opaque-rep export resources, the dtor's job — releasing
+            // whatever the rep refers to (typically an inner-component
+            // handle) — has to be done by user code, since wit-bindgen
+            // has no idea what the rep means. Emit a REQUIRED `dtor`
+            // method on the trait so users can't silently forget it and
+            // leak inner handles.
+            if self.is_opaque_export_resource(resource) {
+                uwriteln!(
+                    self.src,
+                    r#"
+/// Drop the resource referred to by `handle`.
+///
+/// `handle` is the opaque `u32` rep that was previously passed to
+/// `_resource_new` (typically the inner-component handle returned by
+/// the leaf's constructor). Implementations are expected to release
+/// the underlying resource — for example, by reconstructing the
+/// inner-component wrapper via `from_handle` and dropping it so the
+/// inner component's `[resource-drop]` intrinsic fires.
+///
+/// This method is REQUIRED (no default) because the correct shape
+/// depends on what the rep refers to.
+fn dtor(handle: u32);
+"#
+                );
+            }
             for method in methods {
                 self.src.push_str(method);
             }
@@ -2845,13 +2870,19 @@ impl {camel} {{
         {resource}::handle(&self.handle)
     }}
 
-    /// No-op destructor. Opaque-rep resources do not own boxed memory in
-    /// the component that re-exports them — the rep is just a `u32` that
-    /// references something owned by another component. The drop intrinsic
-    /// is wired below so the runtime still gets called, but there is
-    /// nothing to free here.
+    /// Destructor shim for opaque-rep resources. Forwards the rep
+    /// (which is a `u32`, NOT a `Box`-allocated pointer) to the
+    /// user-supplied `Guest{camel}::dtor` trait method, where the user is
+    /// expected to release any resource that the rep refers to (e.g. by
+    /// reconstructing the inner-component handle and dropping it).
+    ///
+    /// The rep arrives as `*mut u8` because the canonical ABI dtor
+    /// signature is `fn(*mut u8)`; we re-cast it back to `u32` since
+    /// opaque-rep never allocates a real pointer.
     #[doc(hidden)]
-    pub unsafe fn dtor<T: 'static>(_rep: *mut u8) {{}}
+    pub unsafe fn dtor<T: Guest{camel}>(rep: *mut u8) {{
+        T::dtor(rep as u32)
+    }}
 }}"#
                 );
             } else {
