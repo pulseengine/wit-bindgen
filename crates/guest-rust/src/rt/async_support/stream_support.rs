@@ -937,13 +937,19 @@ mod alloc_amortization_tests {
         // Warm-up: the first call allocates the reused buffer once.
         let (warm, first) = count_allocs(|| now(rx.next()));
         assert_eq!(first, Some(0xAB));
-        assert!(warm >= 1, "first next() should allocate the buffer (got {warm})");
+        assert!(
+            warm >= 1,
+            "first next() should allocate the buffer (got {warm})"
+        );
 
         // Steady state: every subsequent call reuses the buffer => no allocs.
         for i in 0..8 {
             let (n, item) = count_allocs(|| now(rx.next()));
             assert_eq!(item, Some(0xAB));
-            assert_eq!(n, 0, "next() #{i} after warm-up must not allocate (got {n})");
+            assert_eq!(
+                n, 0,
+                "next() #{i} after warm-up must not allocate (got {n})"
+            );
         }
     }
 
@@ -954,13 +960,101 @@ mod alloc_amortization_tests {
         // Warm-up: the first call allocates the reused buffer once.
         let (warm, first) = count_allocs(|| now(tx.write_one(1)));
         assert_eq!(first, None, "a fully-sent value returns None");
-        assert!(warm >= 1, "first write_one() should allocate the buffer (got {warm})");
+        assert!(
+            warm >= 1,
+            "first write_one() should allocate the buffer (got {warm})"
+        );
 
         // Steady state: every subsequent call reuses the buffer => no allocs.
         for i in 0..8 {
             let (n, unsent) = count_allocs(|| now(tx.write_one(i as u8)));
             assert_eq!(unsent, None);
-            assert_eq!(n, 0, "write_one() #{i} after warm-up must not allocate (got {n})");
+            assert_eq!(
+                n, 0,
+                "write_one() #{i} after warm-up must not allocate (got {n})"
+            );
+        }
+    }
+
+    std::thread_local! {
+        static SEQ: Cell<u8> = const { Cell::new(0) };
+    }
+
+    /// A `stream<u8>` whose reads serve as MANY items as the reader's buffer has
+    /// spare capacity for, each a distinct sequential value. This is what tells
+    /// a correct single-item `next` (which reserves exactly one slot) apart from
+    /// one that over-reserves and silently drops the extra items.
+    #[derive(Clone)]
+    struct BatchStreamOps;
+
+    unsafe impl StreamOps for BatchStreamOps {
+        type Payload = u8;
+        fn new(&mut self) -> u64 {
+            0
+        }
+        fn elem_layout(&self) -> Layout {
+            Layout::new::<u8>()
+        }
+        fn native_abi_matches_canonical_abi(&self) -> bool {
+            true
+        }
+        fn contains_lists(&self) -> bool {
+            false
+        }
+        unsafe fn lower(&mut self, _: u8, _: *mut u8) {
+            unreachable!()
+        }
+        unsafe fn dealloc_lists(&mut self, _: *mut u8) {
+            unreachable!()
+        }
+        unsafe fn lift(&mut self, _: *mut u8) -> u8 {
+            unreachable!()
+        }
+        unsafe fn start_write(&mut self, _: u32, _: *const u8, amt: usize) -> u32 {
+            (amt as u32) << 4
+        }
+        unsafe fn start_read(&mut self, _: u32, val: *mut u8, amt: usize) -> u32 {
+            // Serve the reader's ENTIRE offered spare capacity with sequential
+            // bytes. A `next` that reserves exactly one slot reads one item; an
+            // over-reserving one would pull several and drop all but the last.
+            if amt == 0 {
+                return 0;
+            }
+            SEQ.with(|s| {
+                for k in 0..amt {
+                    let v = s.get();
+                    unsafe { val.add(k).write(v) };
+                    s.set(v.wrapping_add(1));
+                }
+            });
+            (amt as u32) << 4
+        }
+        unsafe fn cancel_read(&mut self, _: u32) -> u32 {
+            0
+        }
+        unsafe fn cancel_write(&mut self, _: u32) -> u32 {
+            0
+        }
+        unsafe fn drop_readable(&mut self, _: u32) {}
+        unsafe fn drop_writable(&mut self, _: u32) {}
+    }
+
+    /// Regression guard for the `reserve_exact(1)` in `next()`. `read` consumes
+    /// the buffer's *entire* spare capacity, so an over-reserving `next` would
+    /// pull several items at once and drop all but the last — a silent data
+    /// loss, not just a missed optimization. Against a mock that serves as many
+    /// items as asked, a correct `next` still yields them one at a time, in
+    /// order. (This fails if `reserve_exact(1)` is weakened to `reserve(1)`.)
+    #[test]
+    fn next_reads_exactly_one_item_per_call() {
+        SEQ.with(|s| s.set(0));
+        let (_tx, mut rx) = unsafe { raw_stream_new(BatchStreamOps) };
+        for expected in 0u8..16 {
+            assert_eq!(
+                now(rx.next()),
+                Some(expected),
+                "next() must read exactly one item per call, in order"
+            );
         }
     }
 }
