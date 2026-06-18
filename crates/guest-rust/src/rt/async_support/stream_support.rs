@@ -194,6 +194,10 @@ pub struct RawStreamWriter<O: StreamOps> {
     handle: u32,
     ops: O,
     done: bool,
+    /// Cached single-item buffer reused by [`RawStreamWriter::write_one`] to
+    /// avoid a fresh heap allocation on every call. Its capacity is retained
+    /// across calls (see `write_one`); it is logically empty between calls.
+    one_buf: Vec<O::Payload>,
 }
 
 impl<O> RawStreamWriter<O>
@@ -206,6 +210,7 @@ where
             handle,
             ops,
             done: false,
+            one_buf: Vec::new(),
         }
     }
 
@@ -305,10 +310,28 @@ where
     /// `Some(value)`, otherwise `None` is returned indicating the value was
     /// sent.
     pub async fn write_one(&mut self, value: O::Payload) -> Option<O::Payload> {
-        // TODO: can probably be a bit more efficient about this and avoid
-        // moving `value` onto the heap in some situations, but that's left as
-        // an optimization for later.
-        self.write_all(alloc::vec![value]).await.pop()
+        // Reuse a cached single-item buffer rather than allocating a fresh
+        // `Vec` on every call. After warm-up this makes the single-item write
+        // path zero-allocation in steady state for payloads whose native
+        // representation matches the canonical ABI (the common scalar case):
+        // `write_all`/`AbiBuffer::into_vec` preserve the buffer's backing
+        // storage, so the retained capacity is handed straight back here.
+        //
+        // The buffer is moved out of `self` (leaving an empty, non-allocating
+        // `Vec`) for the duration of the write because `write_all` borrows
+        // `self` mutably. If this future is cancelled mid-write the cached
+        // capacity is simply lost and the next call re-allocates once — a
+        // missed optimization, never a correctness issue.
+        let mut buf = core::mem::take(&mut self.one_buf);
+        buf.clear();
+        buf.push(value);
+        let mut buf = self.write_all(buf).await;
+        // On a successful send `buf` is empty and `pop()` yields `None`; if the
+        // reader hung up the unsent `value` is still present and returned.
+        let unsent = buf.pop();
+        buf.clear();
+        self.one_buf = buf;
+        unsent
     }
 }
 
@@ -472,6 +495,10 @@ pub struct RawStreamReader<O: StreamOps> {
     handle: AtomicU32,
     ops: O,
     done: bool,
+    /// Cached single-item buffer reused by [`RawStreamReader::next`] to avoid a
+    /// fresh heap allocation on every call. Its capacity is retained across
+    /// calls; it is logically empty between calls.
+    next_buf: Vec<O::Payload>,
 }
 
 impl<O: StreamOps> fmt::Debug for RawStreamReader<O> {
@@ -489,6 +516,7 @@ impl<O: StreamOps> RawStreamReader<O> {
             handle: AtomicU32::new(handle),
             ops,
             done: false,
+            next_buf: Vec::new(),
         }
     }
 
@@ -538,10 +566,34 @@ impl<O: StreamOps> RawStreamReader<O> {
     /// This is a higher-level method than [`StreamReader::read`] in that it
     /// reads only a single item and does not expose control over cancellation.
     pub async fn next(&mut self) -> Option<O::Payload> {
-        // TODO: should amortize this allocation and avoid doing it every time.
-        // Or somehow perhaps make this more optimal.
-        let (_result, mut buf) = self.read(Vec::with_capacity(1)).await;
-        buf.pop()
+        // Reuse a cached single-item buffer rather than allocating a fresh
+        // `Vec::with_capacity(1)` on every call. After warm-up this makes the
+        // single-item read path zero-allocation in steady state for payloads
+        // whose native representation matches the canonical ABI (the common
+        // scalar case): `read` returns the same buffer it was handed, so the
+        // retained capacity is reused on the next call.
+        //
+        // The buffer is moved out of `self` (leaving an empty, non-allocating
+        // `Vec`) for the duration of the read because `read` borrows `self`
+        // mutably. If this future is cancelled mid-read the cached capacity is
+        // simply lost and the next call re-allocates once — a missed
+        // optimization, never a correctness issue.
+        let mut buf = core::mem::take(&mut self.next_buf);
+        buf.clear();
+        // `read` consumes the buffer's *entire* spare capacity, so to read a
+        // single item `next` must hand it a buffer whose spare capacity is
+        // exactly one. Use `reserve_exact`, not `reserve`: the latter rounds
+        // small allocations up to a minimum capacity (e.g. 8 elements for byte
+        // payloads), which would make `read` pull several items at once and
+        // then drop all but the last via `pop()`. Once allocated this buffer is
+        // only ever filled with a single item, so its capacity never grows and
+        // `reserve_exact` is a no-op on every subsequent reused call.
+        buf.reserve_exact(1);
+        let (_result, mut buf) = self.read(buf).await;
+        let item = buf.pop();
+        buf.clear();
+        self.next_buf = buf;
+        item
     }
 
     /// Reads all items from this stream and returns the list.
