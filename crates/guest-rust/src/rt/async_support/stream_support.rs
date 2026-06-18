@@ -801,3 +801,166 @@ where
         self.pin_project().cancel()
     }
 }
+
+/// Host-side allocation-counting tests for the single-item helpers.
+///
+/// These run natively (no component-model host) by driving `next` / `write_one`
+/// against a mock [`StreamOps`] that completes every operation synchronously,
+/// so the futures resolve on their first poll and never touch the wasm task
+/// machinery. A counting global allocator then proves the amortization claim
+/// mechanically: the first call allocates the reused buffer, every subsequent
+/// call allocates nothing. This is the host-side measurement requested in
+/// pulseengine/wit-bindgen#1 (a runtime async measurement is separately blocked
+/// on pulseengine/witness#107).
+#[cfg(all(test, feature = "std"))]
+mod alloc_amortization_tests {
+    use super::*;
+    use crate::rt::async_support::raw_stream_new;
+    use core::alloc::{GlobalAlloc, Layout};
+    use core::cell::Cell;
+    use core::future::Future;
+    use core::task::{Context, Poll, Waker};
+    use std::alloc::System;
+
+    // Per-thread allocation counter. `const`-initialized so that the first
+    // access inside the global allocator never itself allocates (which would
+    // recurse). Being thread-local keeps the count immune to allocations made
+    // by other tests running concurrently.
+    std::thread_local! {
+        static ALLOCS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    struct CountingAlloc;
+
+    // Counts every fresh/grown allocation (alloc, alloc_zeroed, realloc) and
+    // otherwise defers to the system allocator. `dealloc` is intentionally not
+    // counted: steady-state reuse should perform zero allocations, which is
+    // what the tests assert.
+    unsafe impl GlobalAlloc for CountingAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            ALLOCS.with(|c| c.set(c.get() + 1));
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            ALLOCS.with(|c| c.set(c.get() + 1));
+            unsafe { System.alloc_zeroed(layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            ALLOCS.with(|c| c.set(c.get() + 1));
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING: CountingAlloc = CountingAlloc;
+
+    /// Runs `f` and returns `(allocations performed on this thread, result)`.
+    fn count_allocs<R>(f: impl FnOnce() -> R) -> (u64, R) {
+        let before = ALLOCS.with(Cell::get);
+        let r = f();
+        let after = ALLOCS.with(Cell::get);
+        (after - before, r)
+    }
+
+    /// Drives a future expected to resolve on its first poll (true for the mock
+    /// below, which completes synchronously).
+    fn now<F: Future>(fut: F) -> F::Output {
+        let mut fut = core::pin::pin!(fut);
+        let mut cx = Context::from_waker(Waker::noop());
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => v,
+            Poll::Pending => panic!("mock stream op did not complete synchronously"),
+        }
+    }
+
+    /// A `stream<u8>` backed by no real host: every read yields one byte and
+    /// every write accepts all its items, both completing synchronously.
+    #[derive(Clone)]
+    struct MockStreamOps;
+
+    /// `ReturnCode::Completed(1)` in the canonical-ABI encoding (`amt << 4`).
+    const COMPLETED_ONE: u32 = 1 << 4;
+
+    unsafe impl StreamOps for MockStreamOps {
+        type Payload = u8;
+
+        fn new(&mut self) -> u64 {
+            0
+        }
+        fn elem_layout(&self) -> Layout {
+            Layout::new::<u8>()
+        }
+        fn native_abi_matches_canonical_abi(&self) -> bool {
+            true
+        }
+        fn contains_lists(&self) -> bool {
+            false
+        }
+        unsafe fn lower(&mut self, _: u8, _: *mut u8) {
+            unreachable!()
+        }
+        unsafe fn dealloc_lists(&mut self, _: *mut u8) {
+            unreachable!()
+        }
+        unsafe fn lift(&mut self, _: *mut u8) -> u8 {
+            unreachable!()
+        }
+        unsafe fn start_write(&mut self, _stream: u32, _val: *const u8, amt: usize) -> u32 {
+            // Accept every item that was offered.
+            (amt as u32) << 4
+        }
+        unsafe fn start_read(&mut self, _stream: u32, val: *mut u8, amt: usize) -> u32 {
+            // Yield a single byte if the reader gave us room for one.
+            if amt == 0 {
+                return 0; // Completed(0)
+            }
+            unsafe { val.write(0xAB) };
+            COMPLETED_ONE
+        }
+        unsafe fn cancel_read(&mut self, _: u32) -> u32 {
+            0
+        }
+        unsafe fn cancel_write(&mut self, _: u32) -> u32 {
+            0
+        }
+        unsafe fn drop_readable(&mut self, _: u32) {}
+        unsafe fn drop_writable(&mut self, _: u32) {}
+    }
+
+    #[test]
+    fn next_zero_alloc_in_steady_state() {
+        let (_tx, mut rx) = unsafe { raw_stream_new(MockStreamOps) };
+
+        // Warm-up: the first call allocates the reused buffer once.
+        let (warm, first) = count_allocs(|| now(rx.next()));
+        assert_eq!(first, Some(0xAB));
+        assert!(warm >= 1, "first next() should allocate the buffer (got {warm})");
+
+        // Steady state: every subsequent call reuses the buffer => no allocs.
+        for i in 0..8 {
+            let (n, item) = count_allocs(|| now(rx.next()));
+            assert_eq!(item, Some(0xAB));
+            assert_eq!(n, 0, "next() #{i} after warm-up must not allocate (got {n})");
+        }
+    }
+
+    #[test]
+    fn write_one_zero_alloc_in_steady_state() {
+        let (mut tx, _rx) = unsafe { raw_stream_new(MockStreamOps) };
+
+        // Warm-up: the first call allocates the reused buffer once.
+        let (warm, first) = count_allocs(|| now(tx.write_one(1)));
+        assert_eq!(first, None, "a fully-sent value returns None");
+        assert!(warm >= 1, "first write_one() should allocate the buffer (got {warm})");
+
+        // Steady state: every subsequent call reuses the buffer => no allocs.
+        for i in 0..8 {
+            let (n, unsent) = count_allocs(|| now(tx.write_one(i as u8)));
+            assert_eq!(unsent, None);
+            assert_eq!(n, 0, "write_one() #{i} after warm-up must not allocate (got {n})");
+        }
+    }
+}
