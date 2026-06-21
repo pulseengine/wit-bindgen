@@ -946,7 +946,10 @@ unsafe impl<'a, O: StreamOps> WaitableOp for SingleStreamWriteOp<'a, O> {
         // which `WaitableOperation` keeps alive (and synchronously cancels the
         // canon write against) until after this future is dropped.
         let code = unsafe { self.writer.ops.start_write(self.writer.handle, ptr, 1) };
-        rtdebug!("stream.write({}, {ptr:?}, 1) = {code:#x}", self.writer.handle);
+        rtdebug!(
+            "stream.write({}, {ptr:?}, 1) = {code:#x}",
+            self.writer.handle
+        );
         (code, buf)
     }
 
@@ -1033,7 +1036,10 @@ unsafe impl<'a, O: StreamOps> WaitableOp for SingleStreamReadOp<'a, O> {
         // kept alive (and synchronously cancelled against) by
         // `WaitableOperation` until after this future is dropped.
         let code = unsafe { self.reader.ops.start_read(self.reader.handle(), ptr, 1) };
-        rtdebug!("stream.read({}, {ptr:?}, 1) = {code:#x}", self.reader.handle());
+        rtdebug!(
+            "stream.read({}, {ptr:?}, 1) = {code:#x}",
+            self.reader.handle()
+        );
         (code, buf)
     }
 
@@ -1233,7 +1239,10 @@ mod alloc_amortization_tests {
         for i in 0..8 {
             let (n, item) = count_allocs(|| now(rx.next()));
             assert_eq!(item, Some(0xAB));
-            assert_eq!(n, 0, "next() #{i} must perform zero heap allocations (got {n})");
+            assert_eq!(
+                n, 0,
+                "next() #{i} must perform zero heap allocations (got {n})"
+            );
         }
     }
 
@@ -1246,7 +1255,10 @@ mod alloc_amortization_tests {
         for i in 0..8 {
             let (n, unsent) = count_allocs(|| now(tx.write_one(i as u8)));
             assert_eq!(unsent, None, "a fully-sent value returns None");
-            assert_eq!(n, 0, "write_one() #{i} must perform zero heap allocations (got {n})");
+            assert_eq!(
+                n, 0,
+                "write_one() #{i} must perform zero heap allocations (got {n})"
+            );
         }
     }
 
@@ -1370,7 +1382,11 @@ mod alloc_amortization_tests {
         let mut s = InlineSlot::filled(D);
         s.relinquish();
         drop(s);
-        assert_eq!(DROPS.load(SeqCst), 0, "relinquished (sent) value must not drop");
+        assert_eq!(
+            DROPS.load(SeqCst),
+            0,
+            "relinquished (sent) value must not drop"
+        );
 
         // An empty (read-destination) slot has nothing to drop.
         DROPS.store(0, SeqCst);
