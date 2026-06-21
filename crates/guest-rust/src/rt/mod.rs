@@ -153,7 +153,48 @@ pub fn maybe_link_cabi_realloc() {
 /// `cabi_realloc` module above. It's otherwise never explicitly called.
 ///
 /// For more information about this see `./ci/rebuild-libwit-bindgen-cabi.sh`.
-#[cfg(not(target_env = "p2"))]
+/// Canonical-ABI `cabi_realloc` backed by an embedder-provided bounded
+/// allocator instead of the global growing allocator (see the
+/// `cabi-realloc-extern` feature).
+///
+/// The whole canonical realloc is delegated to `__cabi_arena_realloc`, which the
+/// embedder defines (typically in a linkable crate) over a fixed arena that
+/// **traps on exhaustion rather than calling `memory.grow`**. The export itself
+/// stays present, so the same build still links on a composing host (e.g.
+/// wasmtime); only its allocator backing changes, so no `memory.grow` is pulled
+/// in on `cabi_realloc`'s account.
+///
+/// `__cabi_arena_realloc` must honor the full canonical-ABI realloc contract,
+/// identical to the default implementation below:
+///
+/// * `old_len == 0 && new_len == 0` → return `align` as the pointer (zero-size
+///   allocation; no storage).
+/// * `old_len == 0 && new_len != 0` → allocate `new_len` bytes at `align`.
+/// * `old_len != 0` → reallocate the `old_ptr` block (`old_len`/`align`) to
+///   `new_len` bytes.
+/// * Returning null signals allocation failure (the canonical ABI treats this
+///   as a trap); a bounded arena is expected to trap on exhaustion.
+#[cfg(all(not(target_env = "p2"), feature = "cabi-realloc-extern"))]
+pub unsafe fn cabi_realloc(
+    old_ptr: *mut u8,
+    old_len: usize,
+    align: usize,
+    new_len: usize,
+) -> *mut u8 {
+    unsafe extern "C" {
+        fn __cabi_arena_realloc(
+            old_ptr: *mut u8,
+            old_len: usize,
+            align: usize,
+            new_len: usize,
+        ) -> *mut u8;
+    }
+    // SAFETY: forwards the canonical realloc contract verbatim to the
+    // embedder-provided allocator.
+    unsafe { __cabi_arena_realloc(old_ptr, old_len, align, new_len) }
+}
+
+#[cfg(all(not(target_env = "p2"), not(feature = "cabi-realloc-extern")))]
 pub unsafe fn cabi_realloc(
     old_ptr: *mut u8,
     old_len: usize,
@@ -190,6 +231,57 @@ pub unsafe fn cabi_realloc(
         }
     }
     return ptr;
+}
+
+/// Verifies that under `cabi-realloc-extern` the canonical realloc routes to the
+/// embedder-provided `__cabi_arena_realloc` rather than the global allocator.
+/// This test *is* the embedder: it defines `__cabi_arena_realloc` (here backed
+/// by the system allocator so the returned storage is usable) and asserts
+/// `cabi_realloc` forwards to it. Run with
+/// `cargo test -p wit-bindgen --features cabi-realloc-extern`.
+#[cfg(all(test, not(target_env = "p2"), feature = "cabi-realloc-extern", feature = "std"))]
+mod cabi_realloc_extern_tests {
+    use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[unsafe(no_mangle)]
+    unsafe extern "C" fn __cabi_arena_realloc(
+        old_ptr: *mut u8,
+        old_len: usize,
+        align: usize,
+        new_len: usize,
+    ) -> *mut u8 {
+        CALLS.fetch_add(1, SeqCst);
+        use std::alloc::{GlobalAlloc, Layout, System};
+        unsafe {
+            if old_len == 0 {
+                if new_len == 0 {
+                    return align as *mut u8;
+                }
+                System.alloc(Layout::from_size_align_unchecked(new_len, align))
+            } else {
+                System.realloc(
+                    old_ptr,
+                    Layout::from_size_align_unchecked(old_len, align),
+                    new_len,
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn cabi_realloc_routes_to_extern_arena() {
+        let before = CALLS.load(SeqCst);
+        // Allocate, then free via the same entry point (new_len == 0).
+        let p = unsafe { crate::rt::cabi_realloc(core::ptr::null_mut(), 0, 8, 64) };
+        assert!(!p.is_null(), "extern arena returned a usable pointer");
+        assert_eq!(CALLS.load(SeqCst), before + 1, "cabi_realloc forwarded once");
+        // Zero/zero is the canonical "no storage" case and must round-trip align.
+        let z = unsafe { crate::rt::cabi_realloc(core::ptr::null_mut(), 0, 16, 0) };
+        assert_eq!(z as usize, 16);
+        assert_eq!(CALLS.load(SeqCst), before + 2);
+    }
 }
 
 /// Provide a hook for generated export functions to run static constructors at
