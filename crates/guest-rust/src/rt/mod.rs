@@ -239,7 +239,12 @@ pub unsafe fn cabi_realloc(
 /// by the system allocator so the returned storage is usable) and asserts
 /// `cabi_realloc` forwards to it. Run with
 /// `cargo test -p wit-bindgen --features cabi-realloc-extern`.
-#[cfg(all(test, not(target_env = "p2"), feature = "cabi-realloc-extern", feature = "std"))]
+#[cfg(all(
+    test,
+    not(target_env = "p2"),
+    feature = "cabi-realloc-extern",
+    feature = "std"
+))]
 mod cabi_realloc_extern_tests {
     use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
@@ -276,7 +281,11 @@ mod cabi_realloc_extern_tests {
         // Allocate, then free via the same entry point (new_len == 0).
         let p = unsafe { crate::rt::cabi_realloc(core::ptr::null_mut(), 0, 8, 64) };
         assert!(!p.is_null(), "extern arena returned a usable pointer");
-        assert_eq!(CALLS.load(SeqCst), before + 1, "cabi_realloc forwarded once");
+        assert_eq!(
+            CALLS.load(SeqCst),
+            before + 1,
+            "cabi_realloc forwarded once"
+        );
         // Zero/zero is the canonical "no storage" case and must round-trip align.
         let z = unsafe { crate::rt::cabi_realloc(core::ptr::null_mut(), 0, 16, 0) };
         assert_eq!(z as usize, 16);
