@@ -1298,4 +1298,141 @@ mod alloc_amortization_tests {
         // `take` on an empty slot yields nothing.
         assert!(InlineSlot::<D>::empty().take().is_none());
     }
+
+    // --- blocked→cancel path under a mocked `wasip3` task (run under Miri) ---
+    //
+    // The inline path relocates the single-item buffer from a heap `Vec` into
+    // the future frame (`InlineSlot` inside the `WaitableOperation`). The novel
+    // soundness surface is therefore the cancellation path: a blocked op whose
+    // future is dropped in-flight must synchronously cancel the canon op and
+    // unregister its waker *before* the inline storage is freed. The
+    // synchronous-completion tests above never exercise this. These tests force
+    // it — `start` returns `Blocked`, so the op registers a waker (via a mock
+    // task) and the future is then dropped while pending — and under Miri this
+    // checks the cancel-then-free ordering against the inline storage with no
+    // use-after-free or bad aliasing.
+
+    use crate::rt::async_support::cabi::{WASIP3_TASK_V1, wasip3_task, wasip3_task_set};
+    use core::ffi::c_void;
+
+    /// Minimal mock waitable-set: `register` records the callback pointer so the
+    /// drop-time `unregister` has something to remove. The callback is never
+    /// fired (the op is cancelled before it becomes ready), which is exactly the
+    /// blocked→cancel sequence under test.
+    struct MockTask {
+        registered: Cell<*mut c_void>,
+    }
+
+    unsafe extern "C" fn mock_register(
+        ptr: *mut c_void,
+        _waitable: u32,
+        _callback: unsafe extern "C" fn(*mut c_void, u32),
+        callback_ptr: *mut c_void,
+    ) -> *mut c_void {
+        // SAFETY: `ptr` is the `MockTask` installed by `with_mock_task`.
+        let task = unsafe { &*(ptr as *const MockTask) };
+        task.registered.replace(callback_ptr)
+    }
+
+    unsafe extern "C" fn mock_unregister(ptr: *mut c_void, _waitable: u32) -> *mut c_void {
+        // SAFETY: as above.
+        let task = unsafe { &*(ptr as *const MockTask) };
+        task.registered.replace(core::ptr::null_mut())
+    }
+
+    /// Installs a mock `wasip3_task` for the duration of `f`, restoring the
+    /// previous one afterward. `task`/`state` outlive any future created in `f`.
+    fn with_mock_task<R>(f: impl FnOnce() -> R) -> R {
+        let state = MockTask {
+            registered: Cell::new(core::ptr::null_mut()),
+        };
+        let mut task = wasip3_task {
+            version: WASIP3_TASK_V1,
+            ptr: (&state as *const MockTask).cast_mut().cast(),
+            waitable_register: mock_register,
+            waitable_unregister: mock_unregister,
+        };
+        // SAFETY: `task` and `state` live until the end of this function, which
+        // outlives `f` and therefore any in-flight operation created within it.
+        let prev = unsafe { wasip3_task_set(&mut task) };
+        let result = f();
+        // SAFETY: restore the previously-installed task pointer.
+        unsafe { wasip3_task_set(prev) };
+        result
+    }
+
+    /// `StreamOps` whose canon read/write always block and whose cancel reports
+    /// "cancelled, 0 transferred" — forces the blocked→cancel path.
+    #[derive(Clone)]
+    struct BlockingStreamOps;
+
+    const BLOCKED_CODE: u32 = 0xffff_ffff; // ReturnCode::Blocked
+    const CANCELLED_ZERO: u32 = 2; // ReturnCode::Cancelled(0) == (0 << 4) | CANCELLED
+
+    unsafe impl StreamOps for BlockingStreamOps {
+        type Payload = u8;
+        fn new(&mut self) -> u64 {
+            0
+        }
+        fn elem_layout(&self) -> Layout {
+            Layout::new::<u8>()
+        }
+        fn native_abi_matches_canonical_abi(&self) -> bool {
+            true
+        }
+        fn contains_lists(&self) -> bool {
+            false
+        }
+        unsafe fn lower(&mut self, _: u8, _: *mut u8) {
+            unreachable!()
+        }
+        unsafe fn dealloc_lists(&mut self, _: *mut u8) {
+            unreachable!()
+        }
+        unsafe fn lift(&mut self, _: *mut u8) -> u8 {
+            unreachable!()
+        }
+        unsafe fn start_write(&mut self, _: u32, _: *const u8, _: usize) -> u32 {
+            BLOCKED_CODE
+        }
+        unsafe fn start_read(&mut self, _: u32, _: *mut u8, _: usize) -> u32 {
+            BLOCKED_CODE
+        }
+        unsafe fn cancel_read(&mut self, _: u32) -> u32 {
+            CANCELLED_ZERO
+        }
+        unsafe fn cancel_write(&mut self, _: u32) -> u32 {
+            CANCELLED_ZERO
+        }
+        unsafe fn drop_readable(&mut self, _: u32) {}
+        unsafe fn drop_writable(&mut self, _: u32) {}
+    }
+
+    #[test]
+    fn next_inline_blocked_then_cancel_no_uaf() {
+        with_mock_task(|| {
+            let (_tx, mut rx) = unsafe { raw_stream_new(BlockingStreamOps) };
+            let mut cx = Context::from_waker(Waker::noop());
+            let fut = rx.next();
+            let mut fut = core::pin::pin!(fut);
+            // Blocks on first poll (registers a waker via the mock task)...
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            // ...then is dropped while in-flight: `WaitableOperation::drop`
+            // synchronously cancels and unregisters before the inline buffer is
+            // freed. Miri polices the ordering against the inline storage.
+            drop(fut);
+        });
+    }
+
+    #[test]
+    fn write_one_inline_blocked_then_cancel_no_uaf() {
+        with_mock_task(|| {
+            let (mut tx, _rx) = unsafe { raw_stream_new(BlockingStreamOps) };
+            let mut cx = Context::from_waker(Waker::noop());
+            let fut = tx.write_one(7);
+            let mut fut = core::pin::pin!(fut);
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            drop(fut);
+        });
+    }
 }

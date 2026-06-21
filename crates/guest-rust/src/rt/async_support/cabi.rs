@@ -46,21 +46,40 @@
 
 use core::ffi::c_void;
 
-extern_wasm! {
-    unsafe extern "C" {
-        /// Sets the global task pointer to `ptr` provided. Returns the previous
-        /// value.
-        ///
-        /// This function acts as a dual getter and a setter. To get the
-        /// current task pointer a dummy `ptr` can be provided (e.g. NULL) and then
-        /// it's passed back when you're done working with it. When setting the
-        /// current task pointer it's recommended to call this and then call it
-        /// again with the previous value when the tasks's work is done.
-        ///
-        /// For executors they need to ensure that the `ptr` passed in lives for
-        /// the entire lifetime of the component model task.
-        pub fn wasip3_task_set(ptr: *mut wasip3_task) -> *mut wasip3_task;
+/// Sets the global task pointer to `ptr` provided. Returns the previous value.
+///
+/// This function acts as a dual getter and a setter. To get the current task
+/// pointer a dummy `ptr` can be provided (e.g. NULL) and then it's passed back
+/// when you're done working with it. When setting the current task pointer it's
+/// recommended to call this and then call it again with the previous value when
+/// the tasks's work is done.
+///
+/// For executors they need to ensure that the `ptr` passed in lives for the
+/// entire lifetime of the component model task.
+///
+/// On a real `wasm` host this is provided externally (see the module docs). On
+/// non-wasm targets it normally traps — the async ops only register wakers on a
+/// real component-model host — except under `cfg(test)` (with `std`), where it
+/// is a real thread-local get/set so the blocked→cancel paths can be driven
+/// host-side under Miri with a mock [`wasip3_task`].
+#[cfg(target_family = "wasm")]
+unsafe extern "C" {
+    pub fn wasip3_task_set(ptr: *mut wasip3_task) -> *mut wasip3_task;
+}
+
+#[cfg(all(not(target_family = "wasm"), test, feature = "std"))]
+pub unsafe fn wasip3_task_set(ptr: *mut wasip3_task) -> *mut wasip3_task {
+    std::thread_local! {
+        static CURRENT: core::cell::Cell<*mut wasip3_task> =
+            const { core::cell::Cell::new(core::ptr::null_mut()) };
     }
+    CURRENT.with(|c| c.replace(ptr))
+}
+
+#[cfg(all(not(target_family = "wasm"), not(all(test, feature = "std"))))]
+#[allow(unused, reason = "dummy shim for non-wasm compilation, never invoked")]
+pub unsafe fn wasip3_task_set(_ptr: *mut wasip3_task) -> *mut wasip3_task {
+    unreachable!();
 }
 
 /// The first version of `wasip3_task` which implies the existence of the
