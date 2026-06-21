@@ -38,6 +38,19 @@ default = ["macros", "realloc", "async", "std", "bitflags", "macro-string"]
 macros = ["dep:wit-bindgen-rust-macro"]
 realloc = []
 std = []
+
+# Back the canonical-ABI `cabi_realloc` with an embedder-provided, bounded
+# allocator (`__cabi_arena_realloc`) instead of the global growing allocator.
+#
+# This keeps the standard `cabi_realloc` export present (so the same build still
+# links/instantiates on a composing host such as wasmtime), but routes it to a
+# symbol the embedder supplies from a linkable crate — typically a fixed arena
+# that traps on exhaustion rather than calling `memory.grow`. That removes the
+# allocator/`memory.grow` dependency a canonical-ABI component would otherwise
+# pull in, which is what single-address-space / no-grow embedded lowering needs.
+# The embedder must define `__cabi_arena_realloc` (see the docs on
+# `rt::cabi_realloc`).
+cabi-realloc-extern = []
 async = []
 bitflags = ["dep:bitflags"]
 async-spawn = ['async', 'dep:futures']
