@@ -155,6 +155,9 @@ impl Parse for Config {
                     Opt::DisableCustomSectionLinkHelpers(disable) => {
                         opts.disable_custom_section_link_helpers = disable.value();
                     }
+                    Opt::DisableCabiRealloc(disable) => {
+                        opts.disable_cabi_realloc = disable.value();
+                    }
                     Opt::Debug(enable) => {
                         debug = enable.value();
                     }
@@ -322,6 +325,7 @@ mod kw {
     syn::custom_keyword!(generate_unused_types);
     syn::custom_keyword!(features);
     syn::custom_keyword!(disable_custom_section_link_helpers);
+    syn::custom_keyword!(disable_cabi_realloc);
     syn::custom_keyword!(imports);
     syn::custom_keyword!(debug);
     syn::custom_keyword!(enable_method_chaining);
@@ -404,6 +408,7 @@ enum Opt {
     GenerateUnusedTypes(syn::LitBool),
     Features(Vec<syn::LitStr>),
     DisableCustomSectionLinkHelpers(syn::LitBool),
+    DisableCabiRealloc(syn::LitBool),
     Async(AsyncFilterSet, Span),
     Debug(syn::LitBool),
     EnableMethodChaining(syn::LitBool),
@@ -568,6 +573,10 @@ impl Parse for Opt {
             input.parse::<kw::disable_custom_section_link_helpers>()?;
             input.parse::<Token![:]>()?;
             Ok(Opt::DisableCustomSectionLinkHelpers(input.parse()?))
+        } else if l.peek(kw::disable_cabi_realloc) {
+            input.parse::<kw::disable_cabi_realloc>()?;
+            input.parse::<Token![:]>()?;
+            Ok(Opt::DisableCabiRealloc(input.parse()?))
         } else if l.peek(kw::debug) {
             input.parse::<kw::debug>()?;
             input.parse::<Token![:]>()?;

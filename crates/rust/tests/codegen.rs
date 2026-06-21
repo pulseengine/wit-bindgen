@@ -21,6 +21,31 @@ mod multiple_paths {
     });
 }
 
+// A fully flat/scalar world generated with `disable_cabi_realloc` must still
+// produce valid bindings. The actual elision of the `cabi_realloc` export (and
+// the `memory.grow` it pulls in) is verified end-to-end against the emitted
+// wasm; here we only guard that the option is plumbed and the generated code
+// compiles. See issue #6.
+#[allow(unused, reason = "testing codegen, not functionality")]
+mod disable_cabi_realloc_flat_world {
+    wit_bindgen::generate!({
+        inline: r#"
+        package test:flat;
+
+        interface kernel {
+            tick: func(n: u32) -> u32;
+            set-flag: func(on: bool);
+            read-sensor: func() -> f32;
+        }
+
+        world flat {
+            export kernel;
+        }
+        "#,
+        disable_cabi_realloc: true,
+    });
+}
+
 #[allow(unused, reason = "testing codegen, not functionality")]
 mod inline_and_path {
     wit_bindgen::generate!({

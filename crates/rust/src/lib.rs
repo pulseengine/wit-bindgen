@@ -284,6 +284,31 @@ pub struct Opts {
     #[cfg_attr(feature = "clap", arg(long))]
     pub disable_custom_section_link_helpers: bool,
 
+    /// Do not force the canonical-ABI `cabi_realloc` export to be linked.
+    ///
+    /// By default these bindings force the `cabi_realloc` export to be retained
+    /// and exported (via `maybe_link_cabi_realloc`). That export is backed by
+    /// the global allocator, which on `wasm32` pulls in `memory.grow` — even for
+    /// a world whose interfaces are entirely flat/scalar and therefore never
+    /// actually require canonical-ABI reallocation. That stray `memory.grow`
+    /// blocks single-address-space / no-grow embedded lowering (e.g. fusing with
+    /// a shared, frozen memory layout).
+    ///
+    /// Set this for a world that requires **no** canonical-ABI reallocation, so
+    /// the `cabi_realloc` symbol is left to be garbage-collected by the linker
+    /// and the component links no allocator/`memory.grow` on its account.
+    ///
+    /// A world needs `cabi_realloc` if any imported or exported function passes a
+    /// `list`/`string` (anywhere, transitively) across the boundary, or if an
+    /// exported function has more flattened parameters than fit directly (which
+    /// makes the host spill them into guest memory via `cabi_realloc`). Setting
+    /// this on such a world is a mistake: componentization will fail because the
+    /// canonical options reference a `cabi_realloc` the core module no longer
+    /// exports. It is the caller's responsibility to set this only for
+    /// genuinely flat worlds.
+    #[cfg_attr(feature = "clap", arg(long))]
+    pub disable_cabi_realloc: bool,
+
     #[cfg_attr(feature = "clap", clap(flatten))]
     #[cfg_attr(feature = "serde", serde(flatten))]
     pub async_: AsyncFilterSet,
@@ -1035,14 +1060,24 @@ macro_rules! __export_{world_name}_impl {{
         self.src.set_indent(old_indent);
 
         if let Some(func_name) = func_name {
-            let rt = self.runtime_path().to_string();
+            // The body normally forces `cabi_realloc` to be retained/exported.
+            // For a world that needs no canonical-ABI reallocation, omit that
+            // call (but keep the function, which also serves to anchor the
+            // custom-section `static` above) so the allocator — and the
+            // `memory.grow` it pulls in — is left out entirely. See
+            // `Opts::disable_cabi_realloc`.
+            let body = if self.opts.disable_cabi_realloc {
+                String::new()
+            } else {
+                format!("{}::maybe_link_cabi_realloc();", self.runtime_path())
+            };
             uwriteln!(
                 self.src,
                 "
                 #[inline(never)]
                 #[doc(hidden)]
                 pub fn {func_name}() {{
-                    {rt}::maybe_link_cabi_realloc();
+                    {body}
                 }}
             ",
             );
