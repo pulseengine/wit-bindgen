@@ -10,6 +10,7 @@ use {
         alloc::Layout,
         fmt,
         future::Future,
+        mem::MaybeUninit,
         pin::Pin,
         ptr,
         sync::atomic::{AtomicU32, Ordering::Relaxed},
@@ -194,6 +195,10 @@ pub struct RawStreamWriter<O: StreamOps> {
     handle: u32,
     ops: O,
     done: bool,
+    /// Cached single-item buffer reused by [`RawStreamWriter::write_one`] to
+    /// avoid a fresh heap allocation on every call. Its capacity is retained
+    /// across calls (see `write_one`); it is logically empty between calls.
+    one_buf: Vec<O::Payload>,
 }
 
 impl<O> RawStreamWriter<O>
@@ -206,6 +211,7 @@ where
             handle,
             ops,
             done: false,
+            one_buf: Vec::new(),
         }
     }
 
@@ -305,10 +311,48 @@ where
     /// `Some(value)`, otherwise `None` is returned indicating the value was
     /// sent.
     pub async fn write_one(&mut self, value: O::Payload) -> Option<O::Payload> {
-        // TODO: can probably be a bit more efficient about this and avoid
-        // moving `value` onto the heap in some situations, but that's left as
-        // an optimization for later.
-        self.write_all(alloc::vec![value]).await.pop()
+        // True zero-heap fast path (issue #5): for payloads whose native
+        // representation already matches the canonical ABI (scalars: u32/f32/…)
+        // the value can be sent straight from an inline `[MaybeUninit<T>; 1]`
+        // buffer that lives in the future frame, with no heap allocation at all
+        // — not even on the first call, and with no global-allocator
+        // dependency. Soundness rests on `WaitableOperation`'s cancel-then-free
+        // contract: its `Drop` synchronously cancels the in-flight canon op
+        // before the inline storage is freed, so the runtime can never reference
+        // the buffer after this future is dropped (see `inline single-item
+        // zero-heap path` below and `waitable.rs`).
+        if self.ops.native_abi_matches_canonical_abi() {
+            let (_result, mut slot) = SingleStreamWrite {
+                op: WaitableOperation::new(
+                    SingleStreamWriteOp { writer: self },
+                    InlineSlot::filled(value),
+                ),
+            }
+            .await;
+            // If the value was sent its ownership moved to the stream and `slot`
+            // is empty (`None`); if the reader hung up the value is still here.
+            return slot.take();
+        }
+
+        // Fallback for non-native payloads (lists/resources need a separate
+        // lowered `Cleanup` buffer regardless): reuse a cached single-item
+        // `Vec` rather than allocating a fresh one on every call. After warm-up
+        // this is zero-allocation in steady state; `write_all`/
+        // `AbiBuffer::into_vec` preserve the buffer's backing storage, so the
+        // retained capacity is handed straight back here. The buffer is moved
+        // out of `self` (leaving an empty, non-allocating `Vec`) for the
+        // duration of the write because `write_all` borrows `self` mutably; a
+        // mid-write cancellation merely loses the cached capacity.
+        let mut buf = core::mem::take(&mut self.one_buf);
+        buf.clear();
+        buf.push(value);
+        let mut buf = self.write_all(buf).await;
+        // On a successful send `buf` is empty and `pop()` yields `None`; if the
+        // reader hung up the unsent `value` is still present and returned.
+        let unsent = buf.pop();
+        buf.clear();
+        self.one_buf = buf;
+        unsent
     }
 }
 
@@ -472,6 +516,10 @@ pub struct RawStreamReader<O: StreamOps> {
     handle: AtomicU32,
     ops: O,
     done: bool,
+    /// Cached single-item buffer reused by [`RawStreamReader::next`] to avoid a
+    /// fresh heap allocation on every call. Its capacity is retained across
+    /// calls; it is logically empty between calls.
+    next_buf: Vec<O::Payload>,
 }
 
 impl<O: StreamOps> fmt::Debug for RawStreamReader<O> {
@@ -489,6 +537,7 @@ impl<O: StreamOps> RawStreamReader<O> {
             handle: AtomicU32::new(handle),
             ops,
             done: false,
+            next_buf: Vec::new(),
         }
     }
 
@@ -538,10 +587,46 @@ impl<O: StreamOps> RawStreamReader<O> {
     /// This is a higher-level method than [`StreamReader::read`] in that it
     /// reads only a single item and does not expose control over cancellation.
     pub async fn next(&mut self) -> Option<O::Payload> {
-        // TODO: should amortize this allocation and avoid doing it every time.
-        // Or somehow perhaps make this more optimal.
-        let (_result, mut buf) = self.read(Vec::with_capacity(1)).await;
-        buf.pop()
+        // True zero-heap fast path (issue #5): for payloads whose native
+        // representation already matches the canonical ABI (scalars) read the
+        // single item straight into an inline `[MaybeUninit<T>; 1]` buffer in
+        // the future frame — no heap allocation at all, including the first
+        // call, and no global-allocator dependency. Sound per
+        // `WaitableOperation`'s cancel-then-free contract (see below).
+        if self.ops.native_abi_matches_canonical_abi() {
+            let (_result, mut slot) = SingleStreamRead {
+                op: WaitableOperation::new(
+                    SingleStreamReadOp { reader: self },
+                    InlineSlot::empty(),
+                ),
+            }
+            .await;
+            return slot.take();
+        }
+
+        // Fallback for non-native payloads: reuse a cached single-item buffer
+        // rather than allocating a fresh `Vec::with_capacity(1)` on every call.
+        // After warm-up this is zero-allocation in steady state; `read` returns
+        // the same buffer it was handed, so the retained capacity is reused on
+        // the next call. The buffer is moved out of `self` (leaving an empty,
+        // non-allocating `Vec`) for the read because `read` borrows `self`
+        // mutably; a mid-read cancellation merely loses the cached capacity.
+        let mut buf = core::mem::take(&mut self.next_buf);
+        buf.clear();
+        // `read` consumes the buffer's *entire* spare capacity, so to read a
+        // single item `next` must hand it a buffer whose spare capacity is
+        // exactly one. Use `reserve_exact`, not `reserve`: the latter rounds
+        // small allocations up to a minimum capacity (e.g. 8 elements for byte
+        // payloads), which would make `read` pull several items at once and
+        // then drop all but the last via `pop()`. Once allocated this buffer is
+        // only ever filled with a single item, so its capacity never grows and
+        // `reserve_exact` is a no-op on every subsequent reused call.
+        buf.reserve_exact(1);
+        let (_result, mut buf) = self.read(buf).await;
+        let item = buf.pop();
+        buf.clear();
+        self.next_buf = buf;
+        item
     }
 
     /// Reads all items from this stream and returns the list.
@@ -747,5 +832,705 @@ where
     /// or if this method is called twice.
     pub fn cancel(self: Pin<&mut Self>) -> (StreamResult, Vec<O::Payload>) {
         self.pin_project().cancel()
+    }
+}
+
+// ======================= inline single-item zero-heap path =======================
+//
+// `next` / `write_one` on the `native_abi_matches_canonical_abi()` (scalar)
+// path read/write a single element straight from an inline `[MaybeUninit<T>; 1]`
+// buffer that lives in the future frame, with no heap `Vec` and no global
+// allocator involved — true zero-heap, including the first call (issue #1/#5).
+//
+// Soundness: the inline buffer is held inside a `WaitableOperation` across the
+// `await`. `waitable.rs` guarantees the operation is `PhantomPinned` + driven
+// through `Pin<&mut Self>`, and that its `Drop` *synchronously* cancels the
+// in-flight canonical read/write (`in_progress_cancel`) before the operation —
+// and therefore this inline storage — is freed. So the runtime can never write
+// to (or read from) the inline buffer after this future is dropped: an inline,
+// non-heap buffer is not a use-after-free. This path is gated strictly on the
+// native-ABI case, so no `lift`/`lower`/`dealloc_lists` is ever needed (those
+// only exist when canonical != native, which also forces a separate heap
+// `Cleanup` buffer — see `AbiBuffer::new`).
+
+/// A one-element inline buffer used as a canonical-ABI read/write target without
+/// touching the heap. Only used on the native-ABI (scalar) path.
+struct InlineSlot<T> {
+    slot: [MaybeUninit<T>; 1],
+    /// `true` iff `slot[0]` currently holds an initialized `T` that this buffer
+    /// owns and is responsible for dropping.
+    init: bool,
+}
+
+impl<T> InlineSlot<T> {
+    /// An empty slot, used as the destination of a single-item read.
+    fn empty() -> Self {
+        Self {
+            slot: [MaybeUninit::uninit()],
+            init: false,
+        }
+    }
+
+    /// A slot pre-filled with `value`, used as the source of a single-item write.
+    fn filled(value: T) -> Self {
+        Self {
+            slot: [MaybeUninit::new(value)],
+            init: true,
+        }
+    }
+
+    /// Takes the initialized value out, if any, leaving the slot empty.
+    fn take(&mut self) -> Option<T> {
+        if self.init {
+            self.init = false;
+            // SAFETY: `init` was `true`, so `slot[0]` holds an initialized
+            // value; we read it out exactly once and clear the flag so neither
+            // this read nor `Drop` can observe it again.
+            Some(unsafe { self.slot[0].assume_init_read() })
+        } else {
+            None
+        }
+    }
+
+    /// Relinquishes ownership of the contained value without dropping it: used
+    /// when a write transfers the value to the stream (move semantics; the
+    /// receiver now owns it). Native payloads carry no lists, so there is
+    /// nothing to `dealloc_lists`.
+    fn relinquish(&mut self) {
+        self.init = false;
+    }
+
+    fn as_read_ptr(&mut self) -> *mut u8 {
+        self.slot.as_mut_ptr().cast()
+    }
+
+    fn as_write_ptr(&self) -> *const u8 {
+        self.slot.as_ptr().cast()
+    }
+}
+
+impl<T> Drop for InlineSlot<T> {
+    fn drop(&mut self) {
+        if self.init {
+            // SAFETY: `init` is `true`, so `slot[0]` holds an initialized value
+            // this buffer owns and must drop exactly once.
+            unsafe { self.slot[0].assume_init_drop() };
+        }
+    }
+}
+
+/// Single-item inline write future (mirrors [`RawStreamWrite`] but with an
+/// inline buffer instead of an [`AbiBuffer`]).
+struct SingleStreamWrite<'a, O: StreamOps> {
+    op: WaitableOperation<SingleStreamWriteOp<'a, O>>,
+}
+
+struct SingleStreamWriteOp<'a, O: StreamOps> {
+    writer: &'a mut RawStreamWriter<O>,
+}
+
+unsafe impl<'a, O: StreamOps> WaitableOp for SingleStreamWriteOp<'a, O> {
+    type Start = InlineSlot<O::Payload>;
+    type InProgress = InlineSlot<O::Payload>;
+    type Result = (StreamResult, InlineSlot<O::Payload>);
+    type Cancel = (StreamResult, InlineSlot<O::Payload>);
+
+    fn start(&mut self, buf: Self::Start) -> (u32, Self::InProgress) {
+        if self.writer.done {
+            return (DROPPED, buf);
+        }
+        // Native ABI: the value's in-memory form already matches the canonical
+        // ABI, so write straight from the inline slot.
+        let ptr = buf.as_write_ptr();
+        // SAFETY: `ptr` points at the inline buffer owned by this operation,
+        // which `WaitableOperation` keeps alive (and synchronously cancels the
+        // canon write against) until after this future is dropped.
+        let code = unsafe { self.writer.ops.start_write(self.writer.handle, ptr, 1) };
+        rtdebug!(
+            "stream.write({}, {ptr:?}, 1) = {code:#x}",
+            self.writer.handle
+        );
+        (code, buf)
+    }
+
+    fn start_cancelled(&mut self, buf: Self::Start) -> Self::Cancel {
+        (StreamResult::Cancelled, buf)
+    }
+
+    fn in_progress_update(
+        &mut self,
+        mut buf: Self::InProgress,
+        code: u32,
+    ) -> Result<Self::Result, Self::InProgress> {
+        match ReturnCode::decode(code) {
+            ReturnCode::Blocked => Err(buf),
+            ReturnCode::Dropped(0) => Ok((StreamResult::Dropped, buf)),
+            ReturnCode::Cancelled(0) => Ok((StreamResult::Cancelled, buf)),
+            code @ (ReturnCode::Completed(amt)
+            | ReturnCode::Dropped(amt)
+            | ReturnCode::Cancelled(amt)) => {
+                let amt = usize::try_from(amt).unwrap();
+                // The single item was accepted by the stream; its ownership has
+                // moved there, so relinquish it without dropping our copy.
+                if amt >= 1 {
+                    buf.relinquish();
+                }
+                if let ReturnCode::Dropped(_) = code {
+                    self.writer.done = true;
+                }
+                Ok((StreamResult::Complete(amt), buf))
+            }
+        }
+    }
+
+    fn in_progress_waitable(&mut self, _: &Self::InProgress) -> u32 {
+        self.writer.handle
+    }
+
+    fn in_progress_cancel(&mut self, _: &mut Self::InProgress) -> u32 {
+        // SAFETY: `WaitableOperation` owns the operational state; this just
+        // forwards the synchronous canon cancel.
+        let code = unsafe { self.writer.ops.cancel_write(self.writer.handle) };
+        rtdebug!("stream.cancel-write({}) = {code:#x}", self.writer.handle);
+        code
+    }
+
+    fn result_into_cancel(&mut self, result: Self::Result) -> Self::Cancel {
+        result
+    }
+}
+
+impl<O: StreamOps> Future for SingleStreamWrite<'_, O> {
+    type Output = (StreamResult, InlineSlot<O::Payload>);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: pinning `Self` translates to pinning the inner `op` field,
+        // identical to `RawStreamWrite::pin_project`.
+        unsafe { Pin::new_unchecked(&mut self.get_unchecked_mut().op) }.poll_complete(cx)
+    }
+}
+
+/// Single-item inline read future (mirrors [`RawStreamRead`] but reads into an
+/// inline buffer instead of a `Vec`).
+struct SingleStreamRead<'a, O: StreamOps> {
+    op: WaitableOperation<SingleStreamReadOp<'a, O>>,
+}
+
+struct SingleStreamReadOp<'a, O: StreamOps> {
+    reader: &'a mut RawStreamReader<O>,
+}
+
+unsafe impl<'a, O: StreamOps> WaitableOp for SingleStreamReadOp<'a, O> {
+    type Start = InlineSlot<O::Payload>;
+    type InProgress = InlineSlot<O::Payload>;
+    type Result = (StreamResult, InlineSlot<O::Payload>);
+    type Cancel = (StreamResult, InlineSlot<O::Payload>);
+
+    fn start(&mut self, mut buf: Self::Start) -> (u32, Self::InProgress) {
+        if self.reader.done {
+            return (DROPPED, buf);
+        }
+        // Native ABI: read directly into the inline slot; no lifting buffer.
+        let ptr = buf.as_read_ptr();
+        // SAFETY: `ptr` points at the inline buffer owned by this operation,
+        // kept alive (and synchronously cancelled against) by
+        // `WaitableOperation` until after this future is dropped.
+        let code = unsafe { self.reader.ops.start_read(self.reader.handle(), ptr, 1) };
+        rtdebug!(
+            "stream.read({}, {ptr:?}, 1) = {code:#x}",
+            self.reader.handle()
+        );
+        (code, buf)
+    }
+
+    fn start_cancelled(&mut self, buf: Self::Start) -> Self::Cancel {
+        (StreamResult::Cancelled, buf)
+    }
+
+    fn in_progress_update(
+        &mut self,
+        mut buf: Self::InProgress,
+        code: u32,
+    ) -> Result<Self::Result, Self::InProgress> {
+        match ReturnCode::decode(code) {
+            ReturnCode::Blocked => Err(buf),
+            ReturnCode::Dropped(0) => Ok((StreamResult::Dropped, buf)),
+            ReturnCode::Cancelled(0) => Ok((StreamResult::Cancelled, buf)),
+            code @ (ReturnCode::Completed(amt)
+            | ReturnCode::Dropped(amt)
+            | ReturnCode::Cancelled(amt)) => {
+                let amt = usize::try_from(amt).unwrap();
+                debug_assert!(amt <= 1, "single-item read returned {amt} items");
+                if amt >= 1 {
+                    // The runtime initialized one native item directly in the
+                    // slot; we now own it.
+                    buf.init = true;
+                }
+                if let ReturnCode::Dropped(_) = code {
+                    self.reader.done = true;
+                }
+                Ok((StreamResult::Complete(amt), buf))
+            }
+        }
+    }
+
+    fn in_progress_waitable(&mut self, _: &Self::InProgress) -> u32 {
+        self.reader.handle()
+    }
+
+    fn in_progress_cancel(&mut self, _: &mut Self::InProgress) -> u32 {
+        // SAFETY: forwards the synchronous canon cancel managed by
+        // `WaitableOperation`.
+        let code = unsafe { self.reader.ops.cancel_read(self.reader.handle()) };
+        rtdebug!("stream.cancel-read({}) = {code:#x}", self.reader.handle());
+        code
+    }
+
+    fn result_into_cancel(&mut self, result: Self::Result) -> Self::Cancel {
+        result
+    }
+}
+
+impl<O: StreamOps> Future for SingleStreamRead<'_, O> {
+    type Output = (StreamResult, InlineSlot<O::Payload>);
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: pinning `Self` translates to pinning the inner `op` field,
+        // identical to `RawStreamRead::pin_project`.
+        unsafe { Pin::new_unchecked(&mut self.get_unchecked_mut().op) }.poll_complete(cx)
+    }
+}
+
+/// Host-side allocation-counting tests for the single-item helpers.
+///
+/// These run natively (no component-model host) by driving `next` / `write_one`
+/// against a mock [`StreamOps`] that completes every operation synchronously,
+/// so the futures resolve on their first poll and never touch the wasm task
+/// machinery. A counting global allocator then proves the amortization claim
+/// mechanically: the first call allocates the reused buffer, every subsequent
+/// call allocates nothing. This is the host-side measurement requested in
+/// pulseengine/wit-bindgen#1 (a runtime async measurement is separately blocked
+/// on pulseengine/witness#107).
+#[cfg(all(test, feature = "std"))]
+mod alloc_amortization_tests {
+    use super::*;
+    use crate::rt::async_support::raw_stream_new;
+    use core::alloc::{GlobalAlloc, Layout};
+    use core::cell::Cell;
+    use core::future::Future;
+    use core::task::{Context, Poll, Waker};
+    use std::alloc::System;
+
+    // Per-thread allocation counter. `const`-initialized so that the first
+    // access inside the global allocator never itself allocates (which would
+    // recurse). Being thread-local keeps the count immune to allocations made
+    // by other tests running concurrently.
+    std::thread_local! {
+        static ALLOCS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    struct CountingAlloc;
+
+    // Counts every fresh/grown allocation (alloc, alloc_zeroed, realloc) and
+    // otherwise defers to the system allocator. `dealloc` is intentionally not
+    // counted: steady-state reuse should perform zero allocations, which is
+    // what the tests assert.
+    unsafe impl GlobalAlloc for CountingAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            ALLOCS.with(|c| c.set(c.get() + 1));
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            ALLOCS.with(|c| c.set(c.get() + 1));
+            unsafe { System.alloc_zeroed(layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            ALLOCS.with(|c| c.set(c.get() + 1));
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING: CountingAlloc = CountingAlloc;
+
+    /// Runs `f` and returns `(allocations performed on this thread, result)`.
+    fn count_allocs<R>(f: impl FnOnce() -> R) -> (u64, R) {
+        let before = ALLOCS.with(Cell::get);
+        let r = f();
+        let after = ALLOCS.with(Cell::get);
+        (after - before, r)
+    }
+
+    /// Drives a future expected to resolve on its first poll (true for the mock
+    /// below, which completes synchronously).
+    fn now<F: Future>(fut: F) -> F::Output {
+        let mut fut = core::pin::pin!(fut);
+        let mut cx = Context::from_waker(Waker::noop());
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => v,
+            Poll::Pending => panic!("mock stream op did not complete synchronously"),
+        }
+    }
+
+    /// A `stream<u8>` backed by no real host: every read yields one byte and
+    /// every write accepts all its items, both completing synchronously.
+    #[derive(Clone)]
+    struct MockStreamOps;
+
+    /// `ReturnCode::Completed(1)` in the canonical-ABI encoding (`amt << 4`).
+    const COMPLETED_ONE: u32 = 1 << 4;
+
+    unsafe impl StreamOps for MockStreamOps {
+        type Payload = u8;
+
+        fn new(&mut self) -> u64 {
+            0
+        }
+        fn elem_layout(&self) -> Layout {
+            Layout::new::<u8>()
+        }
+        fn native_abi_matches_canonical_abi(&self) -> bool {
+            true
+        }
+        fn contains_lists(&self) -> bool {
+            false
+        }
+        unsafe fn lower(&mut self, _: u8, _: *mut u8) {
+            unreachable!()
+        }
+        unsafe fn dealloc_lists(&mut self, _: *mut u8) {
+            unreachable!()
+        }
+        unsafe fn lift(&mut self, _: *mut u8) -> u8 {
+            unreachable!()
+        }
+        unsafe fn start_write(&mut self, _stream: u32, _val: *const u8, amt: usize) -> u32 {
+            // Accept every item that was offered.
+            (amt as u32) << 4
+        }
+        unsafe fn start_read(&mut self, _stream: u32, val: *mut u8, amt: usize) -> u32 {
+            // Yield a single byte if the reader gave us room for one.
+            if amt == 0 {
+                return 0; // Completed(0)
+            }
+            unsafe { val.write(0xAB) };
+            COMPLETED_ONE
+        }
+        unsafe fn cancel_read(&mut self, _: u32) -> u32 {
+            0
+        }
+        unsafe fn cancel_write(&mut self, _: u32) -> u32 {
+            0
+        }
+        unsafe fn drop_readable(&mut self, _: u32) {}
+        unsafe fn drop_writable(&mut self, _: u32) {}
+    }
+
+    #[test]
+    fn next_true_zero_heap_scalar() {
+        let (_tx, mut rx) = unsafe { raw_stream_new(MockStreamOps) };
+
+        // True zero-heap (issue #5): for a scalar / native-ABI payload the
+        // single-item read path uses an inline future-frame buffer, so EVERY
+        // call — including the first — performs zero heap allocations.
+        for i in 0..8 {
+            let (n, item) = count_allocs(|| now(rx.next()));
+            assert_eq!(item, Some(0xAB));
+            assert_eq!(
+                n, 0,
+                "next() #{i} must perform zero heap allocations (got {n})"
+            );
+        }
+    }
+
+    #[test]
+    fn write_one_true_zero_heap_scalar() {
+        let (mut tx, _rx) = unsafe { raw_stream_new(MockStreamOps) };
+
+        // True zero-heap (issue #5): the single-item write path uses an inline
+        // future-frame buffer for scalar payloads, so every call allocates zero.
+        for i in 0..8 {
+            let (n, unsent) = count_allocs(|| now(tx.write_one(i as u8)));
+            assert_eq!(unsent, None, "a fully-sent value returns None");
+            assert_eq!(
+                n, 0,
+                "write_one() #{i} must perform zero heap allocations (got {n})"
+            );
+        }
+    }
+
+    std::thread_local! {
+        static SEQ: Cell<u8> = const { Cell::new(0) };
+    }
+
+    /// A `stream<u8>` whose reads serve as MANY items as the reader's buffer has
+    /// spare capacity for, each a distinct sequential value. This is what tells
+    /// a correct single-item `next` (which reserves exactly one slot) apart from
+    /// one that over-reserves and silently drops the extra items.
+    #[derive(Clone)]
+    struct BatchStreamOps;
+
+    unsafe impl StreamOps for BatchStreamOps {
+        type Payload = u8;
+        fn new(&mut self) -> u64 {
+            0
+        }
+        fn elem_layout(&self) -> Layout {
+            Layout::new::<u8>()
+        }
+        fn native_abi_matches_canonical_abi(&self) -> bool {
+            true
+        }
+        fn contains_lists(&self) -> bool {
+            false
+        }
+        unsafe fn lower(&mut self, _: u8, _: *mut u8) {
+            unreachable!()
+        }
+        unsafe fn dealloc_lists(&mut self, _: *mut u8) {
+            unreachable!()
+        }
+        unsafe fn lift(&mut self, _: *mut u8) -> u8 {
+            unreachable!()
+        }
+        unsafe fn start_write(&mut self, _: u32, _: *const u8, amt: usize) -> u32 {
+            (amt as u32) << 4
+        }
+        unsafe fn start_read(&mut self, _: u32, val: *mut u8, amt: usize) -> u32 {
+            // Serve the reader's ENTIRE offered spare capacity with sequential
+            // bytes. A `next` that reserves exactly one slot reads one item; an
+            // over-reserving one would pull several and drop all but the last.
+            if amt == 0 {
+                return 0;
+            }
+            SEQ.with(|s| {
+                for k in 0..amt {
+                    let v = s.get();
+                    unsafe { val.add(k).write(v) };
+                    s.set(v.wrapping_add(1));
+                }
+            });
+            (amt as u32) << 4
+        }
+        unsafe fn cancel_read(&mut self, _: u32) -> u32 {
+            0
+        }
+        unsafe fn cancel_write(&mut self, _: u32) -> u32 {
+            0
+        }
+        unsafe fn drop_readable(&mut self, _: u32) {}
+        unsafe fn drop_writable(&mut self, _: u32) {}
+    }
+
+    /// Regression guard for the `reserve_exact(1)` in `next()`. `read` consumes
+    /// the buffer's *entire* spare capacity, so an over-reserving `next` would
+    /// pull several items at once and drop all but the last — a silent data
+    /// loss, not just a missed optimization. Against a mock that serves as many
+    /// items as asked, a correct `next` still yields them one at a time, in
+    /// order. (This fails if `reserve_exact(1)` is weakened to `reserve(1)`.)
+    #[test]
+    fn next_reads_exactly_one_item_per_call() {
+        SEQ.with(|s| s.set(0));
+        let (_tx, mut rx) = unsafe { raw_stream_new(BatchStreamOps) };
+        for expected in 0u8..16 {
+            assert_eq!(
+                now(rx.next()),
+                Some(expected),
+                "next() must read exactly one item per call, in order"
+            );
+        }
+    }
+
+    /// Directly exercises `InlineSlot`'s ownership/`Drop` semantics with a
+    /// drop-tracking payload. This is the host-reachable unsafe surface of the
+    /// inline path (`assume_init_read` / `assume_init_drop`); run under Miri it
+    /// catches a double-free, a missed drop, or a use-after-read. (The
+    /// cancellation/`Pin` ordering is inherited unchanged from
+    /// `WaitableOperation` — the same machinery the `Vec` path already uses.)
+    #[test]
+    fn inline_slot_drop_semantics() {
+        use core::sync::atomic::{AtomicI32, Ordering::SeqCst};
+        static DROPS: AtomicI32 = AtomicI32::new(0);
+        struct D;
+        impl Drop for D {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, SeqCst);
+            }
+        }
+
+        // A filled slot dropped without taking drops its value exactly once.
+        DROPS.store(0, SeqCst);
+        drop(InlineSlot::filled(D));
+        assert_eq!(DROPS.load(SeqCst), 1, "filled+drop must drop once");
+
+        // After `take`, the caller owns the value; the slot must not drop again.
+        DROPS.store(0, SeqCst);
+        let mut s = InlineSlot::filled(D);
+        let v = s.take();
+        assert!(v.is_some());
+        drop(s);
+        assert_eq!(DROPS.load(SeqCst), 0, "slot must not drop a taken value");
+        drop(v);
+        assert_eq!(DROPS.load(SeqCst), 1, "taken value drops exactly once");
+
+        // After `relinquish` (value sent to the stream), the slot must not drop:
+        // ownership has moved to the receiver.
+        DROPS.store(0, SeqCst);
+        let mut s = InlineSlot::filled(D);
+        s.relinquish();
+        drop(s);
+        assert_eq!(
+            DROPS.load(SeqCst),
+            0,
+            "relinquished (sent) value must not drop"
+        );
+
+        // An empty (read-destination) slot has nothing to drop.
+        DROPS.store(0, SeqCst);
+        drop(InlineSlot::<D>::empty());
+        assert_eq!(DROPS.load(SeqCst), 0, "empty slot drops nothing");
+
+        // `take` on an empty slot yields nothing.
+        assert!(InlineSlot::<D>::empty().take().is_none());
+    }
+
+    // --- blocked→cancel path under a mocked `wasip3` task (run under Miri) ---
+    //
+    // The inline path relocates the single-item buffer from a heap `Vec` into
+    // the future frame (`InlineSlot` inside the `WaitableOperation`). The novel
+    // soundness surface is therefore the cancellation path: a blocked op whose
+    // future is dropped in-flight must synchronously cancel the canon op and
+    // unregister its waker *before* the inline storage is freed. The
+    // synchronous-completion tests above never exercise this. These tests force
+    // it — `start` returns `Blocked`, so the op registers a waker (via a mock
+    // task) and the future is then dropped while pending — and under Miri this
+    // checks the cancel-then-free ordering against the inline storage with no
+    // use-after-free or bad aliasing.
+
+    use crate::rt::async_support::cabi::{WASIP3_TASK_V1, wasip3_task, wasip3_task_set};
+    use core::ffi::c_void;
+
+    /// Minimal mock waitable-set: `register` records the callback pointer so the
+    /// drop-time `unregister` has something to remove. The callback is never
+    /// fired (the op is cancelled before it becomes ready), which is exactly the
+    /// blocked→cancel sequence under test.
+    struct MockTask {
+        registered: Cell<*mut c_void>,
+    }
+
+    unsafe extern "C" fn mock_register(
+        ptr: *mut c_void,
+        _waitable: u32,
+        _callback: unsafe extern "C" fn(*mut c_void, u32),
+        callback_ptr: *mut c_void,
+    ) -> *mut c_void {
+        // SAFETY: `ptr` is the `MockTask` installed by `with_mock_task`.
+        let task = unsafe { &*(ptr as *const MockTask) };
+        task.registered.replace(callback_ptr)
+    }
+
+    unsafe extern "C" fn mock_unregister(ptr: *mut c_void, _waitable: u32) -> *mut c_void {
+        // SAFETY: as above.
+        let task = unsafe { &*(ptr as *const MockTask) };
+        task.registered.replace(core::ptr::null_mut())
+    }
+
+    /// Installs a mock `wasip3_task` for the duration of `f`, restoring the
+    /// previous one afterward. `task`/`state` outlive any future created in `f`.
+    fn with_mock_task<R>(f: impl FnOnce() -> R) -> R {
+        let state = MockTask {
+            registered: Cell::new(core::ptr::null_mut()),
+        };
+        let mut task = wasip3_task {
+            version: WASIP3_TASK_V1,
+            ptr: (&state as *const MockTask).cast_mut().cast(),
+            waitable_register: mock_register,
+            waitable_unregister: mock_unregister,
+        };
+        // SAFETY: `task` and `state` live until the end of this function, which
+        // outlives `f` and therefore any in-flight operation created within it.
+        let prev = unsafe { wasip3_task_set(&mut task) };
+        let result = f();
+        // SAFETY: restore the previously-installed task pointer.
+        unsafe { wasip3_task_set(prev) };
+        result
+    }
+
+    /// `StreamOps` whose canon read/write always block and whose cancel reports
+    /// "cancelled, 0 transferred" — forces the blocked→cancel path.
+    #[derive(Clone)]
+    struct BlockingStreamOps;
+
+    const BLOCKED_CODE: u32 = 0xffff_ffff; // ReturnCode::Blocked
+    const CANCELLED_ZERO: u32 = 2; // ReturnCode::Cancelled(0) == (0 << 4) | CANCELLED
+
+    unsafe impl StreamOps for BlockingStreamOps {
+        type Payload = u8;
+        fn new(&mut self) -> u64 {
+            0
+        }
+        fn elem_layout(&self) -> Layout {
+            Layout::new::<u8>()
+        }
+        fn native_abi_matches_canonical_abi(&self) -> bool {
+            true
+        }
+        fn contains_lists(&self) -> bool {
+            false
+        }
+        unsafe fn lower(&mut self, _: u8, _: *mut u8) {
+            unreachable!()
+        }
+        unsafe fn dealloc_lists(&mut self, _: *mut u8) {
+            unreachable!()
+        }
+        unsafe fn lift(&mut self, _: *mut u8) -> u8 {
+            unreachable!()
+        }
+        unsafe fn start_write(&mut self, _: u32, _: *const u8, _: usize) -> u32 {
+            BLOCKED_CODE
+        }
+        unsafe fn start_read(&mut self, _: u32, _: *mut u8, _: usize) -> u32 {
+            BLOCKED_CODE
+        }
+        unsafe fn cancel_read(&mut self, _: u32) -> u32 {
+            CANCELLED_ZERO
+        }
+        unsafe fn cancel_write(&mut self, _: u32) -> u32 {
+            CANCELLED_ZERO
+        }
+        unsafe fn drop_readable(&mut self, _: u32) {}
+        unsafe fn drop_writable(&mut self, _: u32) {}
+    }
+
+    #[test]
+    fn next_inline_blocked_then_cancel_no_uaf() {
+        with_mock_task(|| {
+            let (_tx, mut rx) = unsafe { raw_stream_new(BlockingStreamOps) };
+            let mut cx = Context::from_waker(Waker::noop());
+            let fut = rx.next();
+            let mut fut = core::pin::pin!(fut);
+            // Blocks on first poll (registers a waker via the mock task)...
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            // ...then is dropped while in-flight: `WaitableOperation::drop`
+            // synchronously cancels and unregisters before the inline buffer is
+            // freed. Miri polices the ordering against the inline storage.
+            drop(fut);
+        });
+    }
+
+    #[test]
+    fn write_one_inline_blocked_then_cancel_no_uaf() {
+        with_mock_task(|| {
+            let (mut tx, _rx) = unsafe { raw_stream_new(BlockingStreamOps) };
+            let mut cx = Context::from_waker(Waker::noop());
+            let fut = tx.write_one(7);
+            let mut fut = core::pin::pin!(fut);
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            drop(fut);
+        });
     }
 }
