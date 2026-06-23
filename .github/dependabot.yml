@@ -1,0 +1,62 @@
+version: 2
+updates:
+  - package-ecosystem: docker
+    directory: /.devcontainer
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+  - package-ecosystem: docker
+    directory: /ci/docker/aarch64-linux
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+  - package-ecosystem: docker
+    directory: /ci/docker/riscv64gc-linux
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+  - package-ecosystem: docker
+    directory: /ci/docker/x86_64-linux
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+  - package-ecosystem: cargo
+    directory: /crates/c
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+  - package-ecosystem: cargo
+    directory: /crates/core
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+  - package-ecosystem: cargo
+    directory: /crates/cpp
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+  - package-ecosystem: cargo
+    directory: /crates/csharp
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
